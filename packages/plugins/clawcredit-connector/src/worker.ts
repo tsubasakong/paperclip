@@ -137,11 +137,15 @@ async function ccFetch<T>(
   if (body) init.body = JSON.stringify(body);
 
   const res = await ctx.http.fetch(url, init);
+  const text = await res.text();
   if (!res.ok) {
-    const text = typeof res.body === "string" ? res.body : JSON.stringify(res.body);
     throw new ApiError(res.status, text);
   }
-  return (typeof res.body === "string" ? JSON.parse(res.body) : res.body) as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new ApiError(res.status, `Invalid JSON: ${text.slice(0, 200)}`);
+  }
 }
 
 class ApiError extends Error {
@@ -501,7 +505,7 @@ const plugin = definePlugin({
       } catch (err) {
         return {
           connected: false,
-          error: err instanceof ApiError ? `Authentication failed (${err.status})` : "Connection failed",
+          error: err instanceof ApiError ? `Authentication failed (${err.status}): ${err.body}` : `Connection failed: ${err instanceof Error ? err.message : String(err)}`,
         };
       }
     });
