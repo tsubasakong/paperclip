@@ -35,10 +35,15 @@ const manifest: PaperclipPluginManifestV1 = {
   instanceConfigSchema: {
     type: "object",
     properties: {
+      apiToken: {
+        type: "string",
+        title: "API Token (dev)",
+        description: "Raw ClawCredit bearer token for local development",
+      },
       apiTokenRef: {
         type: "string",
-        title: "ClawCredit API Token (secret ref)",
-        description: "Secret reference for the ClawCredit bearer token (e.g. env:CLAWCREDIT_TOKEN or vault:clawcredit/token)",
+        title: "API Token Ref (production)",
+        description: "UUID of a Paperclip company secret containing the ClawCredit bearer token",
       },
       serviceUrl: {
         type: "string",
@@ -52,7 +57,7 @@ const manifest: PaperclipPluginManifestV1 = {
         default: 100,
       },
     },
-    required: ["apiTokenRef"],
+    required: [],
   },
 
   jobs: [

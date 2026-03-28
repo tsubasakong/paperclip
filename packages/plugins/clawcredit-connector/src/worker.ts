@@ -12,7 +12,8 @@ import {
 // ---------------------------------------------------------------------------
 
 type ClawCreditConfig = {
-  apiTokenRef: string;
+  apiToken?: string;
+  apiTokenRef?: string;
   serviceUrl?: string;
   maxTransactionUsd?: number;
 };
@@ -159,9 +160,23 @@ class ApiError extends Error {
 
 async function resolveConfig(ctx: PluginContext): Promise<ResolvedConfig | null> {
   const raw = (await ctx.config.get()) as ClawCreditConfig;
-  if (!raw.apiTokenRef) return null;
 
-  const apiToken = await ctx.secrets.resolve(raw.apiTokenRef);
+  // Support two modes:
+  // 1. apiToken (raw string) — for local dev / simple setups
+  // 2. apiTokenRef (UUID) — for production, resolved via Paperclip's company_secrets table
+  let apiToken: string | null = null;
+
+  if (raw.apiToken && typeof raw.apiToken === "string" && raw.apiToken.trim()) {
+    apiToken = raw.apiToken.trim();
+  } else if (raw.apiTokenRef && typeof raw.apiTokenRef === "string" && raw.apiTokenRef.trim()) {
+    try {
+      apiToken = await ctx.secrets.resolve(raw.apiTokenRef.trim());
+    } catch {
+      // Secret resolution failed (invalid UUID, secret not found, etc.)
+      apiToken = null;
+    }
+  }
+
   if (!apiToken) return null;
 
   return {
@@ -774,8 +789,10 @@ const plugin = definePlugin({
     const errors: string[] = [];
     const c = config as ClawCreditConfig;
 
-    if (!c.apiTokenRef || typeof c.apiTokenRef !== "string" || c.apiTokenRef.trim() === "") {
-      errors.push("API token secret reference is required (e.g. env:CLAWCREDIT_TOKEN)");
+    const hasToken = c.apiToken && typeof c.apiToken === "string" && c.apiToken.trim() !== "";
+    const hasRef = c.apiTokenRef && typeof c.apiTokenRef === "string" && c.apiTokenRef.trim() !== "";
+    if (!hasToken && !hasRef) {
+      errors.push("Either API Token (for dev) or API Token Ref (secret UUID for production) is required");
     }
 
     if (c.serviceUrl && typeof c.serviceUrl === "string") {

@@ -655,19 +655,33 @@ export function ClawCreditSettings({ context }: PluginSettingsPageProps) {
         </div>
       )}
 
-      {/* API Token Ref */}
+      {/* API Token (dev) */}
       <div>
-        <label style={labelStyle}>API Token Ref *</label>
+        <label style={labelStyle}>API Token (for local dev)</label>
+        <input
+          type="password"
+          value={(configJson.apiToken as string) ?? ""}
+          onChange={(e) => setField("apiToken", e.target.value)}
+          placeholder="Paste your ClawCredit bearer token here"
+          style={inputStyle}
+        />
+        <div style={hintStyle}>
+          Direct token for local development. For production, use the secret ref below instead.
+        </div>
+      </div>
+
+      {/* API Token Ref (production) */}
+      <div>
+        <label style={labelStyle}>API Token Ref (for production)</label>
         <input
           type="text"
           value={(configJson.apiTokenRef as string) ?? ""}
           onChange={(e) => setField("apiTokenRef", e.target.value)}
-          placeholder="env:CLAWCREDIT_TOKEN"
-          required
+          placeholder="UUID from Paperclip company secrets"
           style={inputStyle}
         />
         <div style={hintStyle}>
-          Secret reference resolved at runtime. Examples: <code>env:CLAWCREDIT_TOKEN</code>, <code>vault:clawcredit/token</code>
+          UUID of a secret created in Paperclip's company secrets. Resolved at runtime, never stored in plain config.
         </div>
       </div>
 
