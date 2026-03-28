@@ -202,18 +202,29 @@ async function readTxnIndex(ctx: PluginContext, companyId: string): Promise<stri
 }
 
 async function appendTxnIndex(ctx: PluginContext, companyId: string, txHash: string): Promise<void> {
-  const index = await readTxnIndex(ctx, companyId);
-  if (index.includes(txHash)) return; // already indexed
-  const updated = [txHash, ...index].slice(0, 1000); // cap at 1000
-  await ctx.state.set(
-    {
-      scopeKind: "company",
-      scopeId: companyId,
-      namespace: "clawcredit",
-      stateKey: "txn-index",
-    },
-    updated,
-  );
+  // Retry loop to handle concurrent read-modify-write on the index.
+  // Individual txn records (keyed by tx_hash) are safe because they're
+  // idempotent upserts. The index is the only shared mutable structure.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const index = await readTxnIndex(ctx, companyId);
+    if (index.includes(txHash)) return; // already indexed
+    const updated = [txHash, ...index].slice(0, 1000);
+    try {
+      await ctx.state.set(
+        {
+          scopeKind: "company",
+          scopeId: companyId,
+          namespace: "clawcredit",
+          stateKey: "txn-index",
+        },
+        updated,
+      );
+      return; // success
+    } catch {
+      // Likely concurrent write — retry with fresh read
+      if (attempt === 2) throw new Error(`Failed to append txn ${txHash} to index after 3 attempts`);
+    }
+  }
 }
 
 async function readTransactions(ctx: PluginContext, companyId: string, limit: number): Promise<StoredTransaction[]> {
@@ -269,9 +280,9 @@ async function syncTransactions(
   const limit = 100;
   let hasMore = true;
   let newestTimestamp: string | null = null;
-  let hitExisting = false;
+  let seenOnPageCount = 0;
 
-  while (hasMore && !hitExisting) {
+  while (hasMore) {
     const query = cursor
       ? `/v1/transaction/history?page=${page}&limit=${limit}&since=${encodeURIComponent(cursor)}`
       : `/v1/transaction/history?page=${page}&limit=${limit}`;
@@ -289,10 +300,11 @@ async function syncTransactions(
       has_more?: boolean;
     }>(ctx, config, "GET", query);
 
+    seenOnPageCount = 0;
     for (const tx of history.transactions) {
       if (existingIndex.has(tx.tx_hash)) {
-        hitExisting = true;
-        break;
+        seenOnPageCount++;
+        continue; // skip but don't break — same-timestamp txns may follow
       }
 
       const amountCents = Math.round(tx.amount * 100);
@@ -320,7 +332,8 @@ async function syncTransactions(
       }
     }
 
-    hasMore = history.has_more === true && !hitExisting;
+    // Stop paginating if entire page was already seen (we've caught up)
+    hasMore = history.has_more === true && seenOnPageCount < history.transactions.length;
     page++;
     if (page > 100) break; // safety limit
   }
@@ -339,8 +352,12 @@ async function syncTransactions(
 function extractBalance(raw: unknown): BalanceResponse | null {
   if (!raw || typeof raw !== "object") return null;
   const r = raw as Record<string, unknown>;
-  if (typeof r.available_usd !== "number" || typeof r.credit_score !== "number") return null;
-  return raw as BalanceResponse;
+  if (typeof r.available_usd !== "number") return null;
+  if (typeof r.credit_score !== "number") return null;
+  if (typeof r.total_available_usd !== "number") return null;
+  // Default chain_credits to empty array if missing/invalid
+  const chainCredits = Array.isArray(r.chain_credits) ? r.chain_credits : [];
+  return { ...r, chain_credits: chainCredits } as BalanceResponse;
 }
 
 // ---------------------------------------------------------------------------
@@ -722,16 +739,23 @@ const plugin = definePlugin({
       }
 
       try {
-        const companies = await ctx.companies.list({ limit: 50, offset: 0 });
-        for (const company of companies) {
-          try {
-            const result = await syncTransactions(ctx, config, company.id);
-            if (result.added > 0) {
-              ctx.logger.info(`Synced ${result.added} transactions for company ${company.id}`);
+        let offset = 0;
+        const pageSize = 50;
+        let hasMore = true;
+        while (hasMore) {
+          const companies = await ctx.companies.list({ limit: pageSize, offset });
+          for (const company of companies) {
+            try {
+              const result = await syncTransactions(ctx, config, company.id);
+              if (result.added > 0) {
+                ctx.logger.info(`Synced ${result.added} transactions for company ${company.id}`);
+              }
+            } catch (err) {
+              ctx.logger.error(`Sync failed for company ${company.id}`, { error: String(err) });
             }
-          } catch (err) {
-            ctx.logger.error(`Sync failed for company ${company.id}`, { error: String(err) });
           }
+          hasMore = companies.length === pageSize;
+          offset += pageSize;
         }
       } catch (err) {
         ctx.logger.error("sync_transactions job failed", { error: String(err) });

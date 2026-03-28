@@ -41,7 +41,7 @@ type TransactionHistoryResponse = {
   transactions: Array<{
     id: string;
     tx_hash: string;
-    amount_usd: number;
+    amountCents: number;
     recipient: string;
     chain: string;
     status: string;
@@ -350,7 +350,7 @@ export function ClawCreditPage({ context }: PluginPageProps) {
                       color: tx.direction === "credit" ? "#22c55e" : "inherit",
                     }}
                   >
-                    {tx.direction === "credit" ? "+" : "-"}{formatUsd(tx.amount_usd)}
+                    {tx.direction === "credit" ? "+" : "-"}{formatUsd(tx.amountCents / 100)}
                   </span>
                   <span style={{ fontSize: 11, color: "var(--muted-foreground, #888)", minWidth: 48 }}>
                     {formatDate(tx.occurredAt)}
