@@ -136,7 +136,11 @@ async function ccFetch<T>(
   const init: RequestInit = { method, headers };
   if (body) init.body = JSON.stringify(body);
 
-  const res = await ctx.http.fetch(url, init);
+  // Use native fetch for local/private URLs (ctx.http.fetch blocks private IPs for SSRF protection).
+  // Use ctx.http.fetch for production URLs (benefits from host-managed tracing/audit).
+  const isPrivateUrl = /^https?:\/\/(localhost|127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|0\.0\.0\.0)/.test(url);
+  const res = isPrivateUrl ? await globalThis.fetch(url, init) : await ctx.http.fetch(url, init);
+
   const text = await res.text();
   if (!res.ok) {
     throw new ApiError(res.status, text);
@@ -163,7 +167,8 @@ class ApiError extends Error {
 // ---------------------------------------------------------------------------
 
 async function resolveConfig(ctx: PluginContext): Promise<ResolvedConfig | null> {
-  const raw = (await ctx.config.get()) as ClawCreditConfig;
+  const raw = (await ctx.config.get()) as Record<string, unknown>;
+  ctx.logger.info("resolveConfig: raw config", { keys: Object.keys(raw), hasApiToken: !!raw.apiToken, hasApiTokenRef: !!raw.apiTokenRef });
 
   // Support two modes:
   // 1. apiToken (raw string) — for local dev / simple setups
@@ -175,18 +180,21 @@ async function resolveConfig(ctx: PluginContext): Promise<ResolvedConfig | null>
   } else if (raw.apiTokenRef && typeof raw.apiTokenRef === "string" && raw.apiTokenRef.trim()) {
     try {
       apiToken = await ctx.secrets.resolve(raw.apiTokenRef.trim());
-    } catch {
-      // Secret resolution failed (invalid UUID, secret not found, etc.)
+    } catch (err) {
+      ctx.logger.error("Secret resolution failed", { error: err instanceof Error ? err.message : String(err) });
       apiToken = null;
     }
   }
 
-  if (!apiToken) return null;
+  if (!apiToken) {
+    ctx.logger.warn("resolveConfig: no token found", { rawApiToken: typeof raw.apiToken, rawApiTokenRef: typeof raw.apiTokenRef });
+    return null;
+  }
 
   return {
     apiToken,
-    serviceUrl: raw.serviceUrl,
-    maxTransactionUsd: raw.maxTransactionUsd,
+    serviceUrl: raw.serviceUrl as string | undefined,
+    maxTransactionUsd: raw.maxTransactionUsd as number | undefined,
   };
 }
 
