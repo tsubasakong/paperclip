@@ -5,7 +5,74 @@ import {
   type PluginPageProps,
   type PluginSettingsPageProps,
 } from "@paperclipai/plugin-sdk/ui";
-import { useState } from "react";
+import { useState, useEffect, type FormEvent } from "react";
+
+// ---------------------------------------------------------------------------
+// Plugin ID (must match manifest)
+// ---------------------------------------------------------------------------
+
+const PLUGIN_ID = "clawcredit.financial-connector";
+
+// ---------------------------------------------------------------------------
+// Config fetcher (same pattern as kitchen-sink example)
+// ---------------------------------------------------------------------------
+
+function hostFetchJson<T>(path: string, init?: RequestInit): Promise<T> {
+  return fetch(path, {
+    ...init,
+    headers: { "Content-Type": "application/json", ...init?.headers },
+  }).then((res) => {
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    return res.json() as Promise<T>;
+  });
+}
+
+function useSettingsConfig() {
+  const [configJson, setConfigJson] = useState<Record<string, unknown>>({});
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    hostFetchJson<{ configJson?: Record<string, unknown> | null } | null>(
+      `/api/plugins/${PLUGIN_ID}/config`,
+    )
+      .then((result) => {
+        if (cancelled) return;
+        setConfigJson(result?.configJson ?? {});
+        setError(null);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  async function save(nextConfig: Record<string, unknown>) {
+    setSaving(true);
+    try {
+      await hostFetchJson(`/api/plugins/${PLUGIN_ID}/config`, {
+        method: "POST",
+        body: JSON.stringify({ configJson: nextConfig }),
+      });
+      setConfigJson(nextConfig);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      throw err;
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return { configJson, setConfigJson, loading, saving, error, save };
+}
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -511,19 +578,32 @@ function MetricTile({
 // ---------------------------------------------------------------------------
 
 export function ClawCreditSettings({ context }: PluginSettingsPageProps) {
+  const { configJson, setConfigJson, loading, saving, error: configError, save } = useSettingsConfig();
   const testConnection = usePluginAction("test-connection");
   const [testing, setTesting] = useState(false);
+  const [savedMsg, setSavedMsg] = useState<string | null>(null);
   const [connectionResult, setConnectionResult] = useState<{
     connected: boolean;
     error?: string;
     available_usd?: number;
   } | null>(null);
 
+  function setField(key: string, value: unknown) {
+    setConfigJson((prev) => ({ ...prev, [key]: value }));
+  }
+
+  async function handleSave(e: FormEvent) {
+    e.preventDefault();
+    await save(configJson);
+    setSavedMsg("Saved");
+    setTimeout(() => setSavedMsg(null), 2000);
+  }
+
   async function handleTestConnection() {
     setTesting(true);
     setConnectionResult(null);
     try {
-      const result = (await testConnection({})) as {
+      const result = (await testConnection({ companyId: context.companyId })) as {
         connected: boolean;
         error?: string;
         available_usd?: number;
@@ -536,16 +616,127 @@ export function ClawCreditSettings({ context }: PluginSettingsPageProps) {
     }
   }
 
+  if (loading) {
+    return <div style={{ fontSize: 13, opacity: 0.6 }}>Loading configuration...</div>;
+  }
+
+  const inputStyle = {
+    width: "100%",
+    padding: "8px 12px",
+    fontSize: 13,
+    borderRadius: 6,
+    border: "1px solid var(--border, #333)",
+    background: "transparent",
+    color: "inherit",
+  };
+
+  const labelStyle = {
+    fontSize: 13,
+    fontWeight: 600 as const,
+    marginBottom: 4,
+    display: "block" as const,
+  };
+
+  const hintStyle = {
+    fontSize: 11,
+    color: "var(--muted-foreground, #888)",
+    marginTop: 4,
+  };
+
   return (
-    <div style={{ maxWidth: 560 }}>
-      <p style={{ fontSize: 13, color: "var(--muted-foreground, #888)", marginBottom: 20 }}>
-        Connect your ClawCredit account to monitor credit, repayment, and agent spending. The API
-        token is resolved from a secret reference at runtime (never stored in plain config).
+    <form onSubmit={handleSave} style={{ maxWidth: 560, display: "grid", gap: 20 }}>
+      <p style={{ fontSize: 13, color: "var(--muted-foreground, #888)", margin: 0 }}>
+        Connect your ClawCredit account to monitor credit, repayment, and agent spending.
       </p>
 
-      {/* Connection test button */}
-      <div style={{ marginBottom: 24 }}>
+      {configError && (
+        <div style={{ padding: "8px 12px", borderRadius: 6, fontSize: 13, background: "rgba(239,68,68,0.08)", color: "#ef4444", border: "1px solid rgba(239,68,68,0.2)" }}>
+          {configError}
+        </div>
+      )}
+
+      {/* API Token (dev) */}
+      <div>
+        <label style={labelStyle}>API Token (for local dev)</label>
+        <input
+          type="password"
+          value={(configJson.apiToken as string) ?? ""}
+          onChange={(e) => setField("apiToken", e.target.value)}
+          placeholder="Paste your ClawCredit bearer token here"
+          style={inputStyle}
+        />
+        <div style={hintStyle}>
+          Direct token for local development. For production, use the secret ref below instead.
+        </div>
+      </div>
+
+      {/* API Token Ref (production) */}
+      <div>
+        <label style={labelStyle}>API Token Ref (for production)</label>
+        <input
+          type="text"
+          value={(configJson.apiTokenRef as string) ?? ""}
+          onChange={(e) => setField("apiTokenRef", e.target.value)}
+          placeholder="UUID from Paperclip company secrets"
+          style={inputStyle}
+        />
+        <div style={hintStyle}>
+          UUID of a secret created in Paperclip's company secrets. Resolved at runtime, never stored in plain config.
+        </div>
+      </div>
+
+      {/* Service URL */}
+      <div>
+        <label style={labelStyle}>Service URL</label>
+        <input
+          type="text"
+          value={(configJson.serviceUrl as string) ?? ""}
+          onChange={(e) => setField("serviceUrl", e.target.value || undefined)}
+          placeholder="Leave blank for default (https://api.clawcredit.com)"
+          style={inputStyle}
+        />
+        <div style={hintStyle}>
+          Override for local dev or staging. Example: <code>http://0.0.0.0:8800</code>
+        </div>
+      </div>
+
+      {/* Max Transaction */}
+      <div>
+        <label style={labelStyle}>Max Transaction (USD)</label>
+        <input
+          type="number"
+          value={(configJson.maxTransactionUsd as number) ?? 100}
+          onChange={(e) => setField("maxTransactionUsd", Number(e.target.value) || 100)}
+          min={1}
+          step={1}
+          style={{ ...inputStyle, width: 160 }}
+        />
+        <div style={hintStyle}>
+          Per-transaction spending cap. Agents cannot exceed this amount. Default: $100.
+        </div>
+      </div>
+
+      {/* Save + Test buttons */}
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
         <button
+          type="submit"
+          disabled={saving}
+          style={{
+            padding: "8px 20px",
+            fontSize: 13,
+            fontWeight: 600,
+            borderRadius: 6,
+            border: "none",
+            background: "var(--primary, #3b82f6)",
+            color: "#fff",
+            cursor: saving ? "wait" : "pointer",
+            opacity: saving ? 0.6 : 1,
+          }}
+        >
+          {saving ? "Saving..." : "Save"}
+        </button>
+        <button
+          type="button"
           onClick={handleTestConnection}
           disabled={testing}
           style={{
@@ -560,41 +751,26 @@ export function ClawCreditSettings({ context }: PluginSettingsPageProps) {
         >
           {testing ? "Testing..." : "Test Connection"}
         </button>
-
-        {connectionResult && (
-          <div
-            style={{
-              marginTop: 8,
-              padding: "8px 12px",
-              borderRadius: 6,
-              fontSize: 13,
-              background: connectionResult.connected ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.08)",
-              color: connectionResult.connected ? "#22c55e" : "#ef4444",
-              border: `1px solid ${connectionResult.connected ? "rgba(34,197,94,0.2)" : "rgba(239,68,68,0.2)"}`,
-            }}
-          >
-            {connectionResult.connected
-              ? `Connected. Available credit: ${formatUsd(connectionResult.available_usd ?? 0)}`
-              : `Connection failed: ${connectionResult.error}`}
-          </div>
-        )}
+        {savedMsg && <span style={{ fontSize: 13, color: "#22c55e" }}>{savedMsg}</span>}
       </div>
 
-      {/* Info */}
-      <div style={{ fontSize: 12, color: "var(--muted-foreground, #888)", lineHeight: 1.6 }}>
-        <p style={{ marginBottom: 8 }}>
-          <strong>API Token Ref:</strong> A secret reference like <code>env:CLAWCREDIT_TOKEN</code> or{" "}
-          <code>vault:clawcredit/token</code>. The actual token is resolved at runtime, never stored in config.
-        </p>
-        <p style={{ marginBottom: 8 }}>
-          <strong>Max Transaction:</strong> Per-transaction spending cap. Agents cannot make
-          payments exceeding this amount. Default: $100.
-        </p>
-        <p>
-          <strong>Service URL:</strong> Leave blank to use the default ClawCredit API. Set a custom
-          URL for local development or staging environments.
-        </p>
-      </div>
-    </div>
+      {/* Connection result */}
+      {connectionResult && (
+        <div
+          style={{
+            padding: "8px 12px",
+            borderRadius: 6,
+            fontSize: 13,
+            background: connectionResult.connected ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.08)",
+            color: connectionResult.connected ? "#22c55e" : "#ef4444",
+            border: `1px solid ${connectionResult.connected ? "rgba(34,197,94,0.2)" : "rgba(239,68,68,0.2)"}`,
+          }}
+        >
+          {connectionResult.connected
+            ? `Connected. Available credit: ${formatUsd(connectionResult.available_usd ?? 0)}`
+            : `Connection failed: ${connectionResult.error}`}
+        </div>
+      )}
+    </form>
   );
 }

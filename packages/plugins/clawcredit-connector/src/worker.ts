@@ -12,7 +12,8 @@ import {
 // ---------------------------------------------------------------------------
 
 type ClawCreditConfig = {
-  apiTokenRef: string;
+  apiToken?: string;
+  apiTokenRef?: string;
   serviceUrl?: string;
   maxTransactionUsd?: number;
 };
@@ -135,12 +136,20 @@ async function ccFetch<T>(
   const init: RequestInit = { method, headers };
   if (body) init.body = JSON.stringify(body);
 
-  const res = await ctx.http.fetch(url, init);
+  // Use native fetch for local/private URLs (ctx.http.fetch blocks private IPs for SSRF protection).
+  // Use ctx.http.fetch for production URLs (benefits from host-managed tracing/audit).
+  const isPrivateUrl = /^https?:\/\/(localhost|127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|0\.0\.0\.0)/.test(url);
+  const res = isPrivateUrl ? await globalThis.fetch(url, init) : await ctx.http.fetch(url, init);
+
+  const text = await res.text();
   if (!res.ok) {
-    const text = typeof res.body === "string" ? res.body : JSON.stringify(res.body);
     throw new ApiError(res.status, text);
   }
-  return (typeof res.body === "string" ? JSON.parse(res.body) : res.body) as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new ApiError(res.status, `Invalid JSON: ${text.slice(0, 200)}`);
+  }
 }
 
 class ApiError extends Error {
@@ -158,16 +167,34 @@ class ApiError extends Error {
 // ---------------------------------------------------------------------------
 
 async function resolveConfig(ctx: PluginContext): Promise<ResolvedConfig | null> {
-  const raw = (await ctx.config.get()) as ClawCreditConfig;
-  if (!raw.apiTokenRef) return null;
+  const raw = (await ctx.config.get()) as Record<string, unknown>;
+  ctx.logger.info("resolveConfig: raw config", { keys: Object.keys(raw), hasApiToken: !!raw.apiToken, hasApiTokenRef: !!raw.apiTokenRef });
 
-  const apiToken = await ctx.secrets.resolve(raw.apiTokenRef);
-  if (!apiToken) return null;
+  // Support two modes:
+  // 1. apiToken (raw string) — for local dev / simple setups
+  // 2. apiTokenRef (UUID) — for production, resolved via Paperclip's company_secrets table
+  let apiToken: string | null = null;
+
+  if (raw.apiToken && typeof raw.apiToken === "string" && raw.apiToken.trim()) {
+    apiToken = raw.apiToken.trim();
+  } else if (raw.apiTokenRef && typeof raw.apiTokenRef === "string" && raw.apiTokenRef.trim()) {
+    try {
+      apiToken = await ctx.secrets.resolve(raw.apiTokenRef.trim());
+    } catch (err) {
+      ctx.logger.error("Secret resolution failed", { error: err instanceof Error ? err.message : String(err) });
+      apiToken = null;
+    }
+  }
+
+  if (!apiToken) {
+    ctx.logger.warn("resolveConfig: no token found", { rawApiToken: typeof raw.apiToken, rawApiTokenRef: typeof raw.apiTokenRef });
+    return null;
+  }
 
   return {
     apiToken,
-    serviceUrl: raw.serviceUrl,
-    maxTransactionUsd: raw.maxTransactionUsd,
+    serviceUrl: raw.serviceUrl as string | undefined,
+    maxTransactionUsd: raw.maxTransactionUsd as number | undefined,
   };
 }
 
@@ -486,7 +513,7 @@ const plugin = definePlugin({
       } catch (err) {
         return {
           connected: false,
-          error: err instanceof ApiError ? `Authentication failed (${err.status})` : "Connection failed",
+          error: err instanceof ApiError ? `Authentication failed (${err.status}): ${err.body}` : `Connection failed: ${err instanceof Error ? err.message : String(err)}`,
         };
       }
     });
@@ -774,8 +801,10 @@ const plugin = definePlugin({
     const errors: string[] = [];
     const c = config as ClawCreditConfig;
 
-    if (!c.apiTokenRef || typeof c.apiTokenRef !== "string" || c.apiTokenRef.trim() === "") {
-      errors.push("API token secret reference is required (e.g. env:CLAWCREDIT_TOKEN)");
+    const hasToken = c.apiToken && typeof c.apiToken === "string" && c.apiToken.trim() !== "";
+    const hasRef = c.apiTokenRef && typeof c.apiTokenRef === "string" && c.apiTokenRef.trim() !== "";
+    if (!hasToken && !hasRef) {
+      errors.push("Either API Token (for dev) or API Token Ref (secret UUID for production) is required");
     }
 
     if (c.serviceUrl && typeof c.serviceUrl === "string") {
