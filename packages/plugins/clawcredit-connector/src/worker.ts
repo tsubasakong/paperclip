@@ -12,6 +12,12 @@ import {
 // ---------------------------------------------------------------------------
 
 type ClawCreditConfig = {
+  apiTokenRef: string;
+  serviceUrl?: string;
+  maxTransactionUsd?: number;
+};
+
+type ResolvedConfig = {
   apiToken: string;
   serviceUrl?: string;
   maxTransactionUsd?: number;
@@ -29,14 +35,12 @@ type BalanceResponse = {
     expires_at?: string;
   }>;
   total_available_usd: number;
-};
-
-type RepaymentResponse = {
-  repayment_amount_due_usd: number;
-  repayment_due_at: string | null;
-  repayment_status: "open" | "paid" | "overdue" | null;
-  repayment_urgency: string | null;
-  repayment_days_until_due: number | null;
+  // Repayment fields (included in balance response from ClawCredit)
+  repayment_amount_due_usd?: number;
+  repayment_due_at?: string | null;
+  repayment_status?: "open" | "paid" | "overdue" | null;
+  repayment_urgency?: string | null;
+  repayment_days_until_due?: number | null;
 };
 
 type PayResponse = {
@@ -51,7 +55,6 @@ type PayResponse = {
 type StoredTransaction = {
   id: string;
   tx_hash: string;
-  amount_usd: number;
   amountCents: number;
   recipient: string;
   chain: string;
@@ -66,17 +69,50 @@ type StoredTransaction = {
 };
 
 // ---------------------------------------------------------------------------
-// In-memory cache (60s TTL for balance/repayment reads)
+// FIX #1: Company-scoped in-memory cache (keyed by companyId)
 // ---------------------------------------------------------------------------
 
 type CachedData<T> = { data: T; fetchedAt: number };
 const CACHE_TTL_MS = 60_000;
 
-let balanceCache: CachedData<BalanceResponse> | null = null;
-let repaymentCache: CachedData<RepaymentResponse> | null = null;
+const balanceCacheByCompany = new Map<string, CachedData<BalanceResponse>>();
 
-function isFresh<T>(cache: CachedData<T> | null): cache is CachedData<T> {
-  return cache !== null && Date.now() - cache.fetchedAt < CACHE_TTL_MS;
+function getCachedBalance(companyId: string): CachedData<BalanceResponse> | null {
+  const entry = balanceCacheByCompany.get(companyId);
+  if (entry && Date.now() - entry.fetchedAt < CACHE_TTL_MS) return entry;
+  return null;
+}
+
+function setCachedBalance(companyId: string, data: BalanceResponse): void {
+  balanceCacheByCompany.set(companyId, { data, fetchedAt: Date.now() });
+  // Evict stale entries to prevent unbounded growth
+  if (balanceCacheByCompany.size > 100) {
+    const now = Date.now();
+    for (const [key, val] of balanceCacheByCompany) {
+      if (now - val.fetchedAt > CACHE_TTL_MS) balanceCacheByCompany.delete(key);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// FIX #5: Cents-based money helpers
+// ---------------------------------------------------------------------------
+
+function validateAmountCents(cents: unknown): { valid: true; cents: number } | { valid: false; error: string } {
+  if (typeof cents !== "number" || !Number.isInteger(cents)) {
+    return { valid: false, error: "amount_cents must be an integer" };
+  }
+  if (cents <= 0) {
+    return { valid: false, error: "amount_cents must be positive" };
+  }
+  if (cents > 999_999_99) {
+    return { valid: false, error: "amount_cents exceeds maximum ($999,999.99)" };
+  }
+  return { valid: true, cents };
+}
+
+function centsToUsd(cents: number): number {
+  return cents / 100;
 }
 
 // ---------------------------------------------------------------------------
@@ -85,7 +121,7 @@ function isFresh<T>(cache: CachedData<T> | null): cache is CachedData<T> {
 
 async function ccFetch<T>(
   ctx: PluginContext,
-  config: ClawCreditConfig,
+  config: ResolvedConfig,
   method: string,
   path: string,
   body?: unknown,
@@ -118,41 +154,86 @@ class ApiError extends Error {
 }
 
 // ---------------------------------------------------------------------------
-// State helpers
+// FIX #3: Secret-resolved config
 // ---------------------------------------------------------------------------
 
-async function getConfig(ctx: PluginContext): Promise<ClawCreditConfig> {
-  const raw = await ctx.config.get();
-  return raw as ClawCreditConfig;
+async function resolveConfig(ctx: PluginContext): Promise<ResolvedConfig | null> {
+  const raw = (await ctx.config.get()) as ClawCreditConfig;
+  if (!raw.apiTokenRef) return null;
+
+  const apiToken = await ctx.secrets.resolve(raw.apiTokenRef);
+  if (!apiToken) return null;
+
+  return {
+    apiToken,
+    serviceUrl: raw.serviceUrl,
+    maxTransactionUsd: raw.maxTransactionUsd,
+  };
 }
 
-async function readTransactions(ctx: PluginContext, companyId: string): Promise<StoredTransaction[]> {
-  const data = await ctx.state.get({
-    scopeKind: "company",
-    scopeId: companyId,
-    namespace: "clawcredit",
-    stateKey: "transactions",
-  });
-  return (data as StoredTransaction[] | null) ?? [];
+// ---------------------------------------------------------------------------
+// FIX #6: Per-transaction state writes (upsert by tx_hash, not array blob)
+// ---------------------------------------------------------------------------
+
+function txnStateKey(txHash: string): string {
+  return `txn:${txHash}`;
 }
 
-async function writeTransactions(
-  ctx: PluginContext,
-  companyId: string,
-  txns: StoredTransaction[],
-): Promise<void> {
-  // Keep last 1000 transactions
-  const trimmed = txns.slice(0, 1000);
+async function storeTxn(ctx: PluginContext, companyId: string, txn: StoredTransaction): Promise<void> {
   await ctx.state.set(
     {
       scopeKind: "company",
       scopeId: companyId,
       namespace: "clawcredit",
-      stateKey: "transactions",
+      stateKey: txnStateKey(txn.tx_hash),
     },
-    trimmed,
+    txn,
   );
 }
+
+async function readTxnIndex(ctx: PluginContext, companyId: string): Promise<string[]> {
+  const data = await ctx.state.get({
+    scopeKind: "company",
+    scopeId: companyId,
+    namespace: "clawcredit",
+    stateKey: "txn-index",
+  });
+  return (data as string[] | null) ?? [];
+}
+
+async function appendTxnIndex(ctx: PluginContext, companyId: string, txHash: string): Promise<void> {
+  const index = await readTxnIndex(ctx, companyId);
+  if (index.includes(txHash)) return; // already indexed
+  const updated = [txHash, ...index].slice(0, 1000); // cap at 1000
+  await ctx.state.set(
+    {
+      scopeKind: "company",
+      scopeId: companyId,
+      namespace: "clawcredit",
+      stateKey: "txn-index",
+    },
+    updated,
+  );
+}
+
+async function readTransactions(ctx: PluginContext, companyId: string, limit: number): Promise<StoredTransaction[]> {
+  const index = await readTxnIndex(ctx, companyId);
+  const txns: StoredTransaction[] = [];
+  for (const hash of index.slice(0, limit)) {
+    const data = await ctx.state.get({
+      scopeKind: "company",
+      scopeId: companyId,
+      namespace: "clawcredit",
+      stateKey: txnStateKey(hash),
+    });
+    if (data) txns.push(data as StoredTransaction);
+  }
+  return txns;
+}
+
+// ---------------------------------------------------------------------------
+// FIX #7: Incremental sync using cursor
+// ---------------------------------------------------------------------------
 
 async function getSyncCursor(ctx: PluginContext, companyId: string): Promise<string | null> {
   return (await ctx.state.get({
@@ -175,25 +256,26 @@ async function setSyncCursor(ctx: PluginContext, companyId: string, cursor: stri
   );
 }
 
-// ---------------------------------------------------------------------------
-// Sync logic
-// ---------------------------------------------------------------------------
-
 async function syncTransactions(
   ctx: PluginContext,
-  config: ClawCreditConfig,
+  config: ResolvedConfig,
   companyId: string,
 ): Promise<{ added: number }> {
-  const existing = await readTransactions(ctx, companyId);
-  const existingHashes = new Set(existing.map((t) => t.tx_hash));
+  const cursor = await getSyncCursor(ctx, companyId);
+  const existingIndex = new Set(await readTxnIndex(ctx, companyId));
 
-  // Poll all pages
-  const newTxns: StoredTransaction[] = [];
+  let added = 0;
   let page = 1;
   const limit = 100;
   let hasMore = true;
+  let newestTimestamp: string | null = null;
+  let hitExisting = false;
 
-  while (hasMore) {
+  while (hasMore && !hitExisting) {
+    const query = cursor
+      ? `/v1/transaction/history?page=${page}&limit=${limit}&since=${encodeURIComponent(cursor)}`
+      : `/v1/transaction/history?page=${page}&limit=${limit}`;
+
     const history = await ccFetch<{
       transactions: Array<{
         tx_hash: string;
@@ -202,20 +284,22 @@ async function syncTransactions(
         chain: string;
         asset: string;
         status: string;
-        reject_reason?: string;
         created_at: string;
       }>;
       has_more?: boolean;
-    }>(ctx, config, "GET", `/v1/transaction/history?page=${page}&limit=${limit}`);
+    }>(ctx, config, "GET", query);
 
     for (const tx of history.transactions) {
-      if (existingHashes.has(tx.tx_hash)) continue;
+      if (existingIndex.has(tx.tx_hash)) {
+        hitExisting = true;
+        break;
+      }
 
-      newTxns.push({
+      const amountCents = Math.round(tx.amount * 100);
+      const txn: StoredTransaction = {
         id: randomUUID(),
         tx_hash: tx.tx_hash,
-        amount_usd: tx.amount,
-        amountCents: Math.round(tx.amount * 100),
+        amountCents,
         recipient: tx.recipient,
         chain: tx.chain,
         asset: tx.asset,
@@ -225,27 +309,38 @@ async function syncTransactions(
         biller: "clawcredit",
         description: `Payment to ${tx.recipient}`,
         occurredAt: tx.created_at,
-      });
+      };
+
+      await storeTxn(ctx, companyId, txn);
+      await appendTxnIndex(ctx, companyId, tx.tx_hash);
+      added++;
+
+      if (!newestTimestamp || tx.created_at > newestTimestamp) {
+        newestTimestamp = tx.created_at;
+      }
     }
 
-    hasMore = history.has_more === true;
+    hasMore = history.has_more === true && !hitExisting;
     page++;
-    // Safety limit to prevent infinite loops
-    if (page > 100) break;
+    if (page > 100) break; // safety limit
   }
 
-  if (newTxns.length > 0) {
-    const merged = [...newTxns, ...existing].sort(
-      (a, b) => new Date(b.occurredAt).getTime() - new Date(a.occurredAt).getTime(),
-    );
-    await writeTransactions(ctx, companyId, merged);
-
-    if (newTxns[0]) {
-      await setSyncCursor(ctx, companyId, newTxns[0].occurredAt);
-    }
+  if (newestTimestamp) {
+    await setSyncCursor(ctx, companyId, newestTimestamp);
   }
 
-  return { added: newTxns.length };
+  return { added };
+}
+
+// ---------------------------------------------------------------------------
+// FIX #8: Response validation helper
+// ---------------------------------------------------------------------------
+
+function extractBalance(raw: unknown): BalanceResponse | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.available_usd !== "number" || typeof r.credit_score !== "number") return null;
+  return raw as BalanceResponse;
 }
 
 // ---------------------------------------------------------------------------
@@ -257,45 +352,28 @@ const plugin = definePlugin({
     ctx.logger.info("clawcredit-connector plugin setup");
 
     // ------------------------------------------------------------------
-    // getData: credit-status
+    // FIX #1: getData uses companyId from params for cache scoping
     // ------------------------------------------------------------------
     ctx.data.register("credit-status", async (params) => {
-      const config = await getConfig(ctx);
-      if (!config.apiToken) {
+      const companyId = params.companyId as string;
+      const config = await resolveConfig(ctx);
+      if (!config) {
         return { configured: false, error: "No API token configured" };
       }
 
       try {
-        // Use cache for reads (60s TTL)
         let balance: BalanceResponse;
-        if (isFresh(balanceCache)) {
-          balance = balanceCache.data;
+        const cached = companyId ? getCachedBalance(companyId) : null;
+        if (cached) {
+          balance = cached.data;
         } else {
-          balance = await ccFetch<BalanceResponse>(ctx, config, "GET", "/v1/credit/balance");
-          balanceCache = { data: balance, fetchedAt: Date.now() };
-        }
-
-        let repayment: RepaymentResponse;
-        if (isFresh(repaymentCache)) {
-          repayment = repaymentCache.data;
-        } else {
-          try {
-            repayment = await ccFetch<RepaymentResponse>(
-              ctx,
-              config,
-              "GET",
-              "/v1/credit/balance", // repayment fields included in balance response
-            );
-            repaymentCache = { data: repayment, fetchedAt: Date.now() };
-          } catch {
-            repayment = {
-              repayment_amount_due_usd: 0,
-              repayment_due_at: null,
-              repayment_status: null,
-              repayment_urgency: null,
-              repayment_days_until_due: null,
-            };
+          const raw = await ccFetch<unknown>(ctx, config, "GET", "/v1/credit/balance");
+          const validated = extractBalance(raw);
+          if (!validated) {
+            return { configured: true, connected: false, error: "Invalid response from ClawCredit API" };
           }
+          balance = validated;
+          if (companyId) setCachedBalance(companyId, balance);
         }
 
         return {
@@ -306,38 +384,38 @@ const plugin = definePlugin({
             available_usd: balance.available_usd,
             credit_score: balance.credit_score,
             total_available_usd: balance.total_available_usd,
-            chain_credits: balance.chain_credits,
+            chain_credits: balance.chain_credits ?? [],
           },
           repayment: {
-            amount_due_usd: repayment.repayment_amount_due_usd,
-            due_at: repayment.repayment_due_at,
-            status: repayment.repayment_status,
-            urgency: repayment.repayment_urgency,
-            days_until_due: repayment.repayment_days_until_due,
+            amount_due_usd: balance.repayment_amount_due_usd ?? 0,
+            due_at: balance.repayment_due_at ?? null,
+            status: balance.repayment_status ?? null,
+            urgency: balance.repayment_urgency ?? null,
+            days_until_due: balance.repayment_days_until_due ?? null,
           },
         };
       } catch (err) {
-        const staleBalance = balanceCache?.data;
+        const stale = companyId ? balanceCacheByCompany.get(companyId) : undefined;
         return {
           configured: true,
           connected: false,
-          fetchedAt: balanceCache ? new Date(balanceCache.fetchedAt).toISOString() : null,
+          fetchedAt: stale ? new Date(stale.fetchedAt).toISOString() : null,
           error: err instanceof ApiError ? `API ${err.status}` : "Connection failed",
-          balance: staleBalance
+          balance: stale
             ? {
-                available_usd: staleBalance.available_usd,
-                credit_score: staleBalance.credit_score,
-                total_available_usd: staleBalance.total_available_usd,
-                chain_credits: staleBalance.chain_credits,
+                available_usd: stale.data.available_usd,
+                credit_score: stale.data.credit_score,
+                total_available_usd: stale.data.total_available_usd,
+                chain_credits: stale.data.chain_credits ?? [],
               }
             : null,
-          repayment: repaymentCache?.data
+          repayment: stale
             ? {
-                amount_due_usd: repaymentCache.data.repayment_amount_due_usd,
-                due_at: repaymentCache.data.repayment_due_at,
-                status: repaymentCache.data.repayment_status,
-                urgency: repaymentCache.data.repayment_urgency,
-                days_until_due: repaymentCache.data.repayment_days_until_due,
+                amount_due_usd: stale.data.repayment_amount_due_usd ?? 0,
+                due_at: stale.data.repayment_due_at ?? null,
+                status: stale.data.repayment_status ?? null,
+                urgency: stale.data.repayment_urgency ?? null,
+                days_until_due: stale.data.repayment_days_until_due ?? null,
               }
             : null,
         };
@@ -350,26 +428,22 @@ const plugin = definePlugin({
     ctx.data.register("transaction-history", async (params) => {
       const companyId = params.companyId as string;
       if (!companyId) return { transactions: [] };
-      const transactions = await readTransactions(ctx, companyId);
       const limit = Math.min((params.limit as number) || 20, 100);
-      return { transactions: transactions.slice(0, limit) };
+      const transactions = await readTransactions(ctx, companyId, limit);
+      return { transactions };
     });
 
     // ------------------------------------------------------------------
     // getData: promotions
     // ------------------------------------------------------------------
-    ctx.data.register("promotions", async () => {
-      const config = await getConfig(ctx);
-      if (!config.apiToken) return { promotions: [] };
+    ctx.data.register("promotions", async (params) => {
+      const config = await resolveConfig(ctx);
+      if (!config) return { promotions: [] };
 
       try {
-        const res = await ccFetch<{ promotions: unknown[] }>(
-          ctx,
-          config,
-          "GET",
-          "/v1/credit/balance", // promotions included in dashboard overview
-        );
-        return { promotions: res.promotions ?? [] };
+        const raw = await ccFetch<Record<string, unknown>>(ctx, config, "GET", "/v1/credit/balance");
+        const promotions = Array.isArray(raw.promotions) ? raw.promotions : [];
+        return { promotions };
       } catch {
         return { promotions: [] };
       }
@@ -378,14 +452,19 @@ const plugin = definePlugin({
     // ------------------------------------------------------------------
     // performAction: test-connection
     // ------------------------------------------------------------------
-    ctx.actions.register("test-connection", async () => {
-      const config = await getConfig(ctx);
-      if (!config.apiToken) {
-        return { connected: false, error: "No API token configured" };
+    ctx.actions.register("test-connection", async (params) => {
+      const config = await resolveConfig(ctx);
+      if (!config) {
+        return { connected: false, error: "No API token configured or secret resolution failed" };
       }
       try {
-        const balance = await ccFetch<BalanceResponse>(ctx, config, "GET", "/v1/credit/balance");
-        balanceCache = { data: balance, fetchedAt: Date.now() };
+        const raw = await ccFetch<unknown>(ctx, config, "GET", "/v1/credit/balance");
+        const balance = extractBalance(raw);
+        if (!balance) {
+          return { connected: false, error: "Invalid response from ClawCredit API" };
+        }
+        const companyId = params.companyId as string;
+        if (companyId) setCachedBalance(companyId, balance);
         return { connected: true, available_usd: balance.available_usd };
       } catch (err) {
         return {
@@ -399,9 +478,9 @@ const plugin = definePlugin({
     // performAction: sync-now
     // ------------------------------------------------------------------
     ctx.actions.register("sync-now", async (params) => {
-      const config = await getConfig(ctx);
+      const config = await resolveConfig(ctx);
       const companyId = params.companyId as string;
-      if (!config.apiToken || !companyId) {
+      if (!config || !companyId) {
         return { error: "Not configured" };
       }
       try {
@@ -424,14 +503,18 @@ const plugin = definePlugin({
         parametersSchema: { type: "object", properties: {} },
       },
       async (_params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
-        const config = await getConfig(ctx);
-        if (!config.apiToken) {
+        const config = await resolveConfig(ctx);
+        if (!config) {
           return { error: "ClawCredit is not configured. Set up the plugin in Paperclip settings." };
         }
 
         try {
-          const balance = await ccFetch<BalanceResponse>(ctx, config, "GET", "/v1/credit/balance");
-          balanceCache = { data: balance, fetchedAt: Date.now() };
+          const raw = await ccFetch<unknown>(ctx, config, "GET", "/v1/credit/balance");
+          const balance = extractBalance(raw);
+          if (!balance) {
+            return { error: "Invalid response from ClawCredit API. Balance fields missing." };
+          }
+          if (runCtx.companyId) setCachedBalance(runCtx.companyId, balance);
 
           return {
             content: `Available credit: $${balance.available_usd.toFixed(2)} | Score: ${balance.credit_score} | Total (incl. chain grants): $${balance.total_available_usd.toFixed(2)}`,
@@ -455,6 +538,8 @@ const plugin = definePlugin({
 
     // ------------------------------------------------------------------
     // Tool: clawcredit_pay
+    // FIX #2: Stable idempotency, separated error paths
+    // FIX #5: Cents-based amount handling
     // ------------------------------------------------------------------
     ctx.tools.register(
       "clawcredit_pay",
@@ -465,71 +550,79 @@ const plugin = definePlugin({
           type: "object",
           properties: {
             recipient: { type: "string" },
-            amount: { type: "number" },
+            amount_cents: { type: "integer" },
             chain: { type: "string", enum: ["BASE", "SOLANA", "XRPL"] },
             service_name: { type: "string" },
             description: { type: "string" },
             idempotency_key: { type: "string" },
           },
-          required: ["recipient", "amount"],
+          required: ["recipient", "amount_cents"],
         },
       },
       async (params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
-        const config = await getConfig(ctx);
-        if (!config.apiToken) {
+        const config = await resolveConfig(ctx);
+        if (!config) {
           return { error: "ClawCredit is not configured." };
         }
 
         const p = params as {
           recipient: string;
-          amount: number;
+          amount_cents: number;
           chain?: string;
           service_name?: string;
           description?: string;
           idempotency_key?: string;
         };
 
-        // Validate amount
-        if (!p.amount || p.amount <= 0) {
-          return { error: "Amount must be positive." };
+        // FIX #5: Validate cents (integer, positive, bounded)
+        const amountCheck = validateAmountCents(p.amount_cents);
+        if (!amountCheck.valid) {
+          return { error: amountCheck.error };
         }
+        const amountUsd = centsToUsd(amountCheck.cents);
 
         // Spending cap check (static config, no cache dependency)
         const maxUsd = config.maxTransactionUsd ?? 100;
-        if (p.amount > maxUsd) {
+        if (amountUsd > maxUsd) {
           return {
-            error: `Amount $${p.amount.toFixed(2)} exceeds the per-transaction cap of $${maxUsd.toFixed(2)}. Adjust maxTransactionUsd in plugin settings to increase.`,
+            error: `Amount $${amountUsd.toFixed(2)} exceeds the per-transaction cap of $${maxUsd.toFixed(2)}. Adjust maxTransactionUsd in plugin settings to increase.`,
           };
         }
 
         // Live balance check (bypass cache for pay)
         let liveBalance: BalanceResponse;
         try {
-          liveBalance = await ccFetch<BalanceResponse>(ctx, config, "GET", "/v1/credit/balance");
-          balanceCache = { data: liveBalance, fetchedAt: Date.now() };
+          const raw = await ccFetch<unknown>(ctx, config, "GET", "/v1/credit/balance");
+          const validated = extractBalance(raw);
+          if (!validated) {
+            return { error: "Cannot verify balance: invalid API response." };
+          }
+          liveBalance = validated;
+          if (runCtx.companyId) setCachedBalance(runCtx.companyId, liveBalance);
         } catch (err) {
           return {
             error: `Cannot verify balance: ${err instanceof ApiError ? `API ${err.status}` : String(err)}`,
           };
         }
 
-        if (liveBalance.available_usd < p.amount) {
+        if (liveBalance.available_usd < amountUsd) {
           return {
-            error: `Insufficient credit. Available: $${liveBalance.available_usd.toFixed(2)}, requested: $${p.amount.toFixed(2)}.`,
+            error: `Insufficient credit. Available: $${liveBalance.available_usd.toFixed(2)}, requested: $${amountUsd.toFixed(2)}.`,
             data: { available_usd: liveBalance.available_usd },
           };
         }
 
-        // Generate idempotency key if not provided
+        // FIX #2: Stable idempotency key (no Date.now())
         const idempotencyKey =
-          p.idempotency_key || `${runCtx.agentId}-${p.recipient}-${p.amount}-${Date.now()}`;
+          p.idempotency_key || `${runCtx.agentId}:${runCtx.runId}:${p.recipient}:${p.amount_cents}`;
 
         // Execute payment
+        let result: PayResponse;
         try {
-          const result = await ccFetch<PayResponse>(ctx, config, "POST", "/v1/transaction/pay", {
+          result = await ccFetch<PayResponse>(ctx, config, "POST", "/v1/transaction/pay", {
             transaction: {
               recipient: p.recipient,
-              amount: p.amount,
+              amount: amountUsd,
               chain: p.chain || "BASE",
               asset: p.chain === "XRPL" ? "RLUSD" : "USDC",
             },
@@ -539,60 +632,8 @@ const plugin = definePlugin({
             },
             idempotencyKey,
           });
-
-          // Sync-on-write: immediately store the transaction in plugin state
-          if (runCtx.companyId) {
-            const txn: StoredTransaction = {
-              id: randomUUID(),
-              tx_hash: result.tx_hash,
-              amount_usd: result.amount_charged,
-              amountCents: Math.round(result.amount_charged * 100),
-              recipient: p.recipient,
-              chain: result.chain,
-              asset: p.chain === "XRPL" ? "RLUSD" : "USDC",
-              status: result.status,
-              eventKind: "credit_purchase",
-              direction: "debit",
-              biller: "clawcredit",
-              description: p.description || `Payment to ${p.recipient}`,
-              occurredAt: new Date().toISOString(),
-              metadataJson: {
-                agentId: runCtx.agentId,
-                service_name: p.service_name,
-                idempotency_key: idempotencyKey,
-              },
-            };
-
-            try {
-              const existing = await readTransactions(ctx, runCtx.companyId);
-              await writeTransactions(ctx, runCtx.companyId, [txn, ...existing]);
-            } catch (stateErr) {
-              ctx.logger.error("Failed to write transaction to state (payment succeeded)", {
-                tx_hash: result.tx_hash,
-                error: String(stateErr),
-              });
-            }
-          }
-
-          await ctx.activity.log({
-            companyId: runCtx.companyId,
-            message: `ClawCredit payment: $${result.amount_charged.toFixed(2)} to ${p.recipient}`,
-            entityType: "agent",
-            entityId: runCtx.agentId,
-            metadata: { tx_hash: result.tx_hash, chain: result.chain },
-          });
-
-          return {
-            content: `Payment successful. $${result.amount_charged.toFixed(2)} charged on ${result.chain}. Remaining balance: $${result.remaining_balance.toFixed(2)}. TX: ${result.tx_hash}`,
-            data: {
-              status: result.status,
-              tx_hash: result.tx_hash,
-              amount_charged: result.amount_charged,
-              remaining_balance: result.remaining_balance,
-              chain: result.chain,
-            },
-          };
         } catch (err) {
+          // FIX #2: Only API errors here, no post-payment side effects in this catch
           if (err instanceof ApiError) {
             const msg =
               err.status === 402
@@ -604,22 +645,82 @@ const plugin = definePlugin({
           }
           return { error: `Payment failed: ${String(err)}` };
         }
+
+        // FIX #2: Post-payment side effects are fire-and-forget, never mask the success
+        // FIX #6: Per-transaction state write (upsert by tx_hash)
+        if (runCtx.companyId) {
+          const chargedCents = Math.round(result.amount_charged * 100);
+          const txn: StoredTransaction = {
+            id: randomUUID(),
+            tx_hash: result.tx_hash,
+            amountCents: chargedCents,
+            recipient: p.recipient,
+            chain: result.chain,
+            asset: p.chain === "XRPL" ? "RLUSD" : "USDC",
+            status: result.status,
+            eventKind: "credit_purchase",
+            direction: "debit",
+            biller: "clawcredit",
+            description: p.description || `Payment to ${p.recipient}`,
+            occurredAt: new Date().toISOString(),
+            metadataJson: {
+              agentId: runCtx.agentId,
+              service_name: p.service_name,
+              idempotency_key: idempotencyKey,
+            },
+          };
+
+          try {
+            await storeTxn(ctx, runCtx.companyId, txn);
+            await appendTxnIndex(ctx, runCtx.companyId, result.tx_hash);
+          } catch (stateErr) {
+            ctx.logger.error("Failed to write transaction to state (payment succeeded)", {
+              tx_hash: result.tx_hash,
+              error: String(stateErr),
+            });
+          }
+
+          try {
+            await ctx.activity.log({
+              companyId: runCtx.companyId,
+              message: `ClawCredit payment: $${result.amount_charged.toFixed(2)} to ${p.recipient}`,
+              entityType: "agent",
+              entityId: runCtx.agentId,
+              metadata: { tx_hash: result.tx_hash, chain: result.chain },
+            });
+          } catch (logErr) {
+            ctx.logger.error("Activity log failed (payment succeeded)", {
+              tx_hash: result.tx_hash,
+              error: String(logErr),
+            });
+          }
+        }
+
+        return {
+          content: `Payment successful. $${result.amount_charged.toFixed(2)} charged on ${result.chain}. Remaining balance: $${result.remaining_balance.toFixed(2)}. TX: ${result.tx_hash}`,
+          data: {
+            status: result.status,
+            tx_hash: result.tx_hash,
+            amount_charged: result.amount_charged,
+            remaining_balance: result.remaining_balance,
+            chain: result.chain,
+          },
+        };
       },
     );
 
     // ------------------------------------------------------------------
-    // Job: sync_transactions
+    // FIX #1, #4: Job syncs per-company using companies.read
+    // FIX #7: Incremental sync via cursor
     // ------------------------------------------------------------------
     ctx.jobs.register("sync_transactions", async (job) => {
       ctx.logger.info("sync_transactions job started", { runId: job.runId });
-      const config = await getConfig(ctx);
-      if (!config.apiToken) {
+      const config = await resolveConfig(ctx);
+      if (!config) {
         ctx.logger.warn("Sync skipped: no API token configured");
         return;
       }
 
-      // Sync for all companies this plugin is installed on
-      // For now, use instance-level sync with the configured token
       try {
         const companies = await ctx.companies.list({ limit: 50, offset: 0 });
         for (const company of companies) {
@@ -639,10 +740,9 @@ const plugin = definePlugin({
   },
 
   async onHealth() {
-    const hasToken = balanceCache !== null;
     return {
       status: "ok",
-      message: hasToken ? "ClawCredit connected" : "ClawCredit not yet configured",
+      message: balanceCacheByCompany.size > 0 ? "ClawCredit connected" : "ClawCredit not yet configured",
     };
   },
 
@@ -650,8 +750,8 @@ const plugin = definePlugin({
     const errors: string[] = [];
     const c = config as ClawCreditConfig;
 
-    if (!c.apiToken || typeof c.apiToken !== "string" || c.apiToken.trim() === "") {
-      errors.push("API token is required");
+    if (!c.apiTokenRef || typeof c.apiTokenRef !== "string" || c.apiTokenRef.trim() === "") {
+      errors.push("API token secret reference is required (e.g. env:CLAWCREDIT_TOKEN)");
     }
 
     if (c.serviceUrl && typeof c.serviceUrl === "string") {
@@ -672,9 +772,7 @@ const plugin = definePlugin({
   },
 
   async onConfigChanged() {
-    // Clear cache when config changes (new token, new service URL)
-    balanceCache = null;
-    repaymentCache = null;
+    balanceCacheByCompany.clear();
   },
 });
 

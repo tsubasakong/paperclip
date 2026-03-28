@@ -1,7 +1,7 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
 const PLUGIN_ID = "clawcredit.financial-connector";
-const PLUGIN_VERSION = "0.1.0";
+const PLUGIN_VERSION = "0.2.0";
 
 const manifest: PaperclipPluginManifestV1 = {
   id: PLUGIN_ID,
@@ -20,6 +20,8 @@ const manifest: PaperclipPluginManifestV1 = {
     "activity.log.write",
     "agent.tools.register",
     "jobs.schedule",
+    "secrets.read-ref",
+    "companies.read",
     "ui.dashboardWidget.register",
     "ui.page.register",
     "instance.settings.register",
@@ -33,10 +35,10 @@ const manifest: PaperclipPluginManifestV1 = {
   instanceConfigSchema: {
     type: "object",
     properties: {
-      apiToken: {
+      apiTokenRef: {
         type: "string",
-        title: "ClawCredit API Token",
-        description: "Bearer token from ClawCredit registration",
+        title: "ClawCredit API Token (secret ref)",
+        description: "Secret reference for the ClawCredit bearer token (e.g. env:CLAWCREDIT_TOKEN or vault:clawcredit/token)",
       },
       serviceUrl: {
         type: "string",
@@ -50,7 +52,7 @@ const manifest: PaperclipPluginManifestV1 = {
         default: 100,
       },
     },
-    required: ["apiToken"],
+    required: ["apiTokenRef"],
   },
 
   jobs: [
@@ -85,9 +87,9 @@ const manifest: PaperclipPluginManifestV1 = {
             type: "string",
             description: "Merchant URL or recipient ID",
           },
-          amount: {
-            type: "number",
-            description: "Amount in USD",
+          amount_cents: {
+            type: "integer",
+            description: "Amount in USD cents (e.g. 500 = $5.00)",
           },
           chain: {
             type: "string",
@@ -104,10 +106,10 @@ const manifest: PaperclipPluginManifestV1 = {
           },
           idempotency_key: {
             type: "string",
-            description: "Idempotency key to prevent duplicate payments on retry",
+            description: "Stable idempotency key to prevent duplicate payments on retry (required for safety, auto-generated if omitted)",
           },
         },
-        required: ["recipient", "amount"],
+        required: ["recipient", "amount_cents"],
       },
     },
   ],

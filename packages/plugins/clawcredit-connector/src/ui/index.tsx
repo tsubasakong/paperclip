@@ -540,7 +540,7 @@ export function ClawCreditSettings({ context }: PluginSettingsPageProps) {
     <div style={{ maxWidth: 560 }}>
       <p style={{ fontSize: 13, color: "var(--muted-foreground, #888)", marginBottom: 20 }}>
         Connect your ClawCredit account to monitor credit, repayment, and agent spending. The API
-        token is stored securely in Paperclip's plugin configuration.
+        token is resolved from a secret reference at runtime (never stored in plain config).
       </p>
 
       {/* Connection test button */}
@@ -583,8 +583,8 @@ export function ClawCreditSettings({ context }: PluginSettingsPageProps) {
       {/* Info */}
       <div style={{ fontSize: 12, color: "var(--muted-foreground, #888)", lineHeight: 1.6 }}>
         <p style={{ marginBottom: 8 }}>
-          <strong>API Token:</strong> Set in the configuration above. Get a token by registering
-          with ClawCredit using an invite code.
+          <strong>API Token Ref:</strong> A secret reference like <code>env:CLAWCREDIT_TOKEN</code> or{" "}
+          <code>vault:clawcredit/token</code>. The actual token is resolved at runtime, never stored in config.
         </p>
         <p style={{ marginBottom: 8 }}>
           <strong>Max Transaction:</strong> Per-transaction spending cap. Agents cannot make
